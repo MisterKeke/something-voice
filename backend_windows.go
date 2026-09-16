@@ -278,7 +278,7 @@ func drainRecognitionEvents(ctx context.Context, contextObject *ole.IUnknown, ph
 			return err
 		}
 		var fetched uint32
-		hr := comCall(contextObject, 11, uint32(len(events)), uintptr(unsafe.Pointer(&events[0])), uintptr(unsafe.Pointer(&fetched)))
+		hr := comCall(contextObject, 11, uintptr(len(events)), uintptr(unsafe.Pointer(&events[0])), uintptr(unsafe.Pointer(&fetched)))
 		if hr == 1 || fetched == 0 {
 			return nil
 		}
