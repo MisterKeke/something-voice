@@ -62,6 +62,12 @@ if err != nil {
 }
 defer session.Stop()
 
+if err := session.WaitReady(); err != nil {
+	panic(err)
+}
+
+fmt.Println("Listening.")
+
 for {
 	select {
 	case result, ok := <-session.Results():
@@ -79,7 +85,7 @@ for {
 }
 ```
 
-`Session.Stop`, `Recognizer.Stop`, and context cancellation are idempotent ways to stop capture. Results use a bounded channel; a slow consumer applies backpressure, and cancellation still releases the SAPI objects and worker thread.
+`Session.WaitReady` (or the close notification from `Session.Ready`) lets a UI wait until SAPI setup has succeeded before showing a listening state. `Session.Stop`, `Recognizer.Stop`, and context cancellation are idempotent ways to stop capture. Results use a bounded channel; a slow consumer applies backpressure, and cancellation still releases the SAPI objects and worker thread.
 
 ## Limitations
 

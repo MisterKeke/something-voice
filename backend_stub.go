@@ -17,6 +17,6 @@ func (b unsupportedBackend) checkAvailability(context.Context) (Availability, er
 	}, ErrUnsupported
 }
 
-func (b unsupportedBackend) listen(context.Context, []string, chan<- Result) error {
+func (b unsupportedBackend) listen(context.Context, []string, chan<- Result, func(error)) error {
 	return ErrUnsupported
 }

@@ -10,15 +10,15 @@ import (
 type fakeBackend struct {
 	availability    Availability
 	availabilityErr error
-	listenFn        func(context.Context, []string, chan<- Result) error
+	listenFn        func(context.Context, []string, chan<- Result, func(error)) error
 }
 
 func (f *fakeBackend) checkAvailability(context.Context) (Availability, error) {
 	return f.availability, f.availabilityErr
 }
 
-func (f *fakeBackend) listen(ctx context.Context, phrases []string, results chan<- Result) error {
-	return f.listenFn(ctx, phrases, results)
+func (f *fakeBackend) listen(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
+	return f.listenFn(ctx, phrases, results, ready)
 }
 
 func newTestRecognizer(b backend) *Recognizer {
@@ -56,7 +56,8 @@ func TestNewNormalizesLanguage(t *testing.T) {
 func TestSessionStateAndResultDelivery(t *testing.T) {
 	b := &fakeBackend{
 		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
-		listenFn: func(ctx context.Context, phrases []string, results chan<- Result) error {
+		listenFn: func(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
+			ready(nil)
 			results <- Result{Phrase: phrases[0], Timestamp: time.Now()}
 			<-ctx.Done()
 			return ctx.Err()
@@ -66,6 +67,9 @@ func TestSessionStateAndResultDelivery(t *testing.T) {
 	session, err := r.Start(context.Background(), []string{"Open Settings"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := session.WaitReady(); err != nil {
+		t.Fatalf("WaitReady error = %v", err)
 	}
 	if _, err := r.Start(context.Background(), []string{"Other"}); !errors.Is(err, ErrSessionActive) {
 		t.Fatalf("second Start error = %v", err)
@@ -87,7 +91,8 @@ func TestSessionStateAndResultDelivery(t *testing.T) {
 func TestRecognizerStopIsIdempotent(t *testing.T) {
 	b := &fakeBackend{
 		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
-		listenFn: func(ctx context.Context, _ []string, _ chan<- Result) error {
+		listenFn: func(ctx context.Context, _ []string, _ chan<- Result, ready func(error)) error {
+			ready(nil)
 			<-ctx.Done()
 			return ctx.Err()
 		},
@@ -96,6 +101,9 @@ func TestRecognizerStopIsIdempotent(t *testing.T) {
 	session, err := r.Start(context.Background(), []string{"Stop"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := session.WaitReady(); err != nil {
+		t.Fatalf("WaitReady error = %v", err)
 	}
 	r.Stop()
 	r.Stop()
@@ -109,5 +117,26 @@ func TestRecognizerStopIsIdempotent(t *testing.T) {
 	second.Stop()
 	if err := second.Wait(); !errors.Is(err, ErrStopped) {
 		t.Fatalf("second Wait error = %v", err)
+	}
+}
+
+func TestSessionReadinessReportsStartupError(t *testing.T) {
+	expected := errors.New("fake startup failure")
+	b := &fakeBackend{
+		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
+		listenFn: func(context.Context, []string, chan<- Result, func(error)) error {
+			return expected
+		},
+	}
+	r := newTestRecognizer(b)
+	session, err := r.Start(context.Background(), []string{"Start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WaitReady(); !errors.Is(err, expected) {
+		t.Fatalf("WaitReady error = %v", err)
+	}
+	if err := session.Wait(); !errors.Is(err, expected) {
+		t.Fatalf("Wait error = %v", err)
 	}
 }

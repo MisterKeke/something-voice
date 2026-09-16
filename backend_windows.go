@@ -19,13 +19,13 @@ const (
 	clsidSpObjectTokenCategory = "{A910187F-0C7A-45AC-92CC-59EDAFB77B53}"
 	iidISpRecognizer           = "{C2B5F241-DAA0-4507-9E16-5A1C6E6B2C49}"
 	iidISpObjectTokenCategory  = "{2D3D3845-39AF-4850-BBF9-40B49780011D}"
-	sprafTopLevel   = 0x1
-	sprsActive      = 0x1
-	sprsInactive    = 0x0
-	spwtLexical     = 0
-	speiRecognition = 38
-	waitObject0     = 0
-	waitTimeout     = 258
+	sprafTopLevel              = 0x1
+	sprsActive                 = 0x1
+	sprsInactive               = 0x0
+	spwtLexical                = 0
+	speiRecognition            = 38
+	waitObject0                = 0
+	waitTimeout                = 258
 )
 
 // SAPI stores category identifiers as registry paths.
@@ -46,7 +46,6 @@ type sapiEvent struct {
 }
 
 var procWaitForSingleObject = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
-var procCloseHandle = syscall.NewLazyDLL("kernel32.dll").NewProc("CloseHandle")
 
 func newBackend(language string) (backend, error) {
 	return sapiBackend{language: language}, nil
@@ -86,8 +85,8 @@ func (b sapiBackend) checkAvailability(ctx context.Context) (Availability, error
 	return availability, err
 }
 
-func (b sapiBackend) listen(ctx context.Context, phrases []string, results chan<- Result) error {
-	return runCOM(func() error { return b.listenOnCOMThread(ctx, phrases, results) })
+func (b sapiBackend) listen(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
+	return runCOM(func() error { return b.listenOnCOMThread(ctx, phrases, results, ready) })
 }
 
 func runCOM(fn func() error) error {
@@ -178,7 +177,7 @@ func enumCategory(categoryID, requiredAttributes string) (*ole.IUnknown, *ole.IU
 	return category, enum, nil
 }
 
-func (b sapiBackend) listenOnCOMThread(ctx context.Context, phrases []string, results chan<- Result) error {
+func (b sapiBackend) listenOnCOMThread(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
 	token, err := b.findRecognizerToken()
 	if err != nil {
 		return err
@@ -219,11 +218,15 @@ func (b sapiBackend) listenOnCOMThread(ctx context.Context, phrases []string, re
 	if eventHandle == 0 {
 		return fmt.Errorf("%w: SAPI returned a null event handle", ErrStartup)
 	}
-	defer procCloseHandle.Call(eventHandle)
 	commandRule := syscall.StringToUTF16("Commands")
 	if err := requireHR("activate command grammar", comCall(grammar, 20, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsActive)); err != nil {
 		return fmt.Errorf("%w: %v", ErrStartup, err)
 	}
+	if err := ctx.Err(); err != nil {
+		_ = comCall(grammar, 20, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsInactive)
+		return err
+	}
+	ready(nil)
 
 	lookup := make([]string, len(phrases))
 	for i, phrase := range phrases {
@@ -331,7 +334,8 @@ func comCall(object *ole.IUnknown, index int, args ...uintptr) uintptr {
 	callArgs := make([]uintptr, 0, len(args)+1)
 	callArgs = append(callArgs, uintptr(unsafe.Pointer(object)))
 	callArgs = append(callArgs, args...)
-	return syscall.SyscallN(vtable[index], callArgs...)
+	r1, _, _ := syscall.SyscallN(vtable[index], callArgs...)
+	return r1
 }
 
 func mathFloat32Bits(value float32) uint32 {

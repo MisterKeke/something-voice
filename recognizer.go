@@ -60,7 +60,7 @@ type Result struct {
 
 type backend interface {
 	checkAvailability(context.Context) (Availability, error)
-	listen(context.Context, []string, chan<- Result) error
+	listen(context.Context, []string, chan<- Result, func(error)) error
 }
 
 // Recognizer owns one local speech-recognition configuration and permits one session at a time.
@@ -152,10 +152,11 @@ func (r *Recognizer) Start(ctx context.Context, phrases []string) (*Session, err
 	r.mu.Unlock()
 
 	go func() {
-		err := r.backend.listen(listenCtx, normalized, session.results)
+		err := r.backend.listen(listenCtx, normalized, session.results, session.signalReady)
 		if session.wasStopped() || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			err = ErrStopped
 		}
+		session.signalReady(err)
 		session.finish(err)
 		r.finish(session)
 	}()
@@ -202,12 +203,15 @@ type Session struct {
 	results chan Result
 	errors  chan error
 	done    chan struct{}
+	ready   chan struct{}
 	cancel  context.CancelFunc
 
-	stopOnce sync.Once
-	mu       sync.Mutex
-	stopped  bool
-	err      error
+	stopOnce  sync.Once
+	readyOnce sync.Once
+	mu        sync.Mutex
+	stopped   bool
+	readyErr  error
+	err       error
 }
 
 func newSession(cancel context.CancelFunc) *Session {
@@ -215,8 +219,30 @@ func newSession(cancel context.CancelFunc) *Session {
 		results: make(chan Result, 16),
 		errors:  make(chan error, 1),
 		done:    make(chan struct{}),
+		ready:   make(chan struct{}),
 		cancel:  cancel,
 	}
+}
+
+// Ready returns a channel closed when SAPI setup has succeeded or failed.
+// Use WaitReady to retrieve the setup error, if any.
+func (s *Session) Ready() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.ready
+}
+
+// WaitReady blocks until setup has completed and returns its error, if any.
+// A nil error means the session is ready to receive recognition results.
+func (s *Session) WaitReady() error {
+	if s == nil {
+		return fmt.Errorf("%w: nil session", ErrInvalidConfiguration)
+	}
+	<-s.ready
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyErr
 }
 
 // Results returns a bounded stream of recognized results. It is closed when the session ends.
@@ -271,6 +297,15 @@ func (s *Session) wasStopped() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopped
+}
+
+func (s *Session) signalReady(err error) {
+	s.readyOnce.Do(func() {
+		s.mu.Lock()
+		s.readyErr = err
+		s.mu.Unlock()
+		close(s.ready)
+	})
 }
 
 func (s *Session) finish(err error) {
