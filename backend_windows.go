@@ -207,23 +207,23 @@ func (b sapiBackend) listenOnCOMThread(ctx context.Context, phrases []string, re
 	if err := buildCommandGrammar(grammar, phrases); err != nil {
 		return fmt.Errorf("%w: %v", ErrStartup, err)
 	}
-	interest := uintptr(uint64(1) << spEiRecognition)
+	interest := uintptr(uint64(1) << speiRecognition)
 	if err := requireHR("set recognition interest", comCall(contextObject, 10, interest, interest)); err != nil {
 		return fmt.Errorf("%w: %v", ErrStartup, err)
 	}
 	if err := requireHR("set Win32 event notification", comCall(contextObject, 7)); err != nil {
 		return fmt.Errorf("%w: %v", ErrStartup, err)
 	}
-	eventHandle := comCall(contextObject, 8)
+	eventHandle := comCall(contextObject, 9)
 	if eventHandle == 0 {
 		return fmt.Errorf("%w: SAPI returned a null event handle", ErrStartup)
 	}
 	commandRule := syscall.StringToUTF16("Commands")
-	if err := requireHR("activate command grammar", comCall(grammar, 20, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsActive)); err != nil {
+	if err := requireHR("activate command grammar", comCall(grammar, 18, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsActive)); err != nil {
 		return fmt.Errorf("%w: %v", ErrStartup, err)
 	}
 	if err := ctx.Err(); err != nil {
-		_ = comCall(grammar, 20, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsInactive)
+		_ = comCall(grammar, 18, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsInactive)
 		return err
 	}
 	ready(nil)
@@ -234,7 +234,7 @@ func (b sapiBackend) listenOnCOMThread(ctx context.Context, phrases []string, re
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			_ = comCall(grammar, 20, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsInactive)
+			_ = comCall(grammar, 18, uintptr(unsafe.Pointer(&commandRule[0])), 0, sprsInactive)
 			return err
 		}
 		waitResult, _, waitErr := procWaitForSingleObject.Call(eventHandle, 100)
