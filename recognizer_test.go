@@ -3,133 +3,188 @@ package voice
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeBackend struct {
-	availability    Availability
-	availabilityErr error
-	listenFn        func(context.Context, []string, chan<- Result, func(error)) error
+	runFn func(context.Context, Config, func(recognitionEvent) error, func(error)) error
 }
 
-func (f *fakeBackend) checkAvailability(context.Context) (Availability, error) {
-	return f.availability, f.availabilityErr
+func (f *fakeBackend) run(ctx context.Context, cfg Config, emit func(recognitionEvent) error, ready func(error)) error {
+	return f.runFn(ctx, cfg, emit, ready)
 }
 
-func (f *fakeBackend) listen(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
-	return f.listenFn(ctx, phrases, results, ready)
-}
-
-func newTestRecognizer(b backend) *Recognizer {
-	return &Recognizer{language: "en-US", backend: b}
-}
-
-func TestNormalizePhrases(t *testing.T) {
-	got, err := normalizePhrases([]string{"  Open Settings ", "open settings", "Close Settings"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0] != "Open Settings" || got[1] != "Close Settings" {
-		t.Fatalf("normalized phrases = %#v", got)
-	}
-}
-
-func TestNormalizePhrasesRejectsInvalidInput(t *testing.T) {
-	for _, phrases := range [][]string{nil, {""}, {"   "}} {
-		if _, err := normalizePhrases(phrases); !errors.Is(err, ErrInvalidConfiguration) {
-			t.Errorf("normalizePhrases(%#v) error = %v", phrases, err)
-		}
-	}
-}
-
-func TestNewNormalizesLanguage(t *testing.T) {
-	r, err := New(" EN-us ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Language() != "en-US" {
-		t.Fatalf("language = %q", r.Language())
-	}
-}
-
-func TestSessionStateAndResultDelivery(t *testing.T) {
-	b := &fakeBackend{
-		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
-		listenFn: func(ctx context.Context, phrases []string, results chan<- Result, ready func(error)) error {
-			ready(nil)
-			results <- Result{Phrase: phrases[0], Timestamp: time.Now()}
-			<-ctx.Done()
-			return ctx.Err()
+func newTestRecognizer(b backend, output *strings.Builder) *Recognizer {
+	return &Recognizer{
+		config: Config{
+			Output:         output,
+			EventQueueSize: 4,
+			AudioQueueSize: 4,
+			SampleRate:     defaultSampleRate,
+			FeatureDim:     defaultFeatureDim,
+			Model:          ModelConfig{NumThreads: 1},
 		},
+		backend: b,
 	}
-	r := newTestRecognizer(b)
-	session, err := r.Start(context.Background(), []string{"Open Settings"})
+}
+
+func TestFinalResultIsPrintedAndDeliveredOnce(t *testing.T) {
+	var output strings.Builder
+	var callbackCount atomic.Int32
+	b := &fakeBackend{runFn: func(ctx context.Context, _ Config, emit func(recognitionEvent) error, ready func(error)) error {
+		ready(nil)
+		event := recognitionEvent{kind: finalEvent, text: "open settings", finalID: 1}
+		if err := emit(event); err != nil {
+			return err
+		}
+		if err := emit(event); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+
+	r := newTestRecognizer(b, &output)
+	r.config.OnFinal = func(Utterance) { callbackCount.Add(1) }
+	session, err := r.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := session.WaitReady(); err != nil {
-		t.Fatalf("WaitReady error = %v", err)
+		t.Fatal(err)
 	}
-	if _, err := r.Start(context.Background(), []string{"Other"}); !errors.Is(err, ErrSessionActive) {
+	select {
+	case result := <-session.Finals():
+		if result.Text != "open settings" {
+			t.Fatalf("final text = %q", result.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for final result")
+	}
+	if got := output.String(); got != "open settings\n" {
+		t.Fatalf("output = %q", got)
+	}
+	if got := callbackCount.Load(); got != 1 {
+		t.Fatalf("callback count = %d", got)
+	}
+	if err := session.Stop(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("Stop error = %v", err)
+	}
+}
+
+func TestPartialIsNotPrintedOrDeliveredAsFinal(t *testing.T) {
+	var output strings.Builder
+	b := &fakeBackend{runFn: func(ctx context.Context, _ Config, emit func(recognitionEvent) error, ready func(error)) error {
+		ready(nil)
+		if err := emit(recognitionEvent{kind: partialEvent, text: "open set"}); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	r := newTestRecognizer(b, &output)
+	session, err := r.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WaitReady(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case partial := <-session.Partials():
+		if partial.Text != "open set" {
+			t.Fatalf("partial text = %q", partial.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for partial result")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("partial was printed: %q", output.String())
+	}
+	select {
+	case final := <-session.Finals():
+		t.Fatalf("partial became final: %#v", final)
+	default:
+	}
+	if err := session.Stop(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("Stop error = %v", err)
+	}
+}
+
+func TestCancellationClosesChannelsAndReleasesSession(t *testing.T) {
+	var output strings.Builder
+	started := make(chan struct{})
+	b := &fakeBackend{runFn: func(ctx context.Context, _ Config, _ func(recognitionEvent) error, ready func(error)) error {
+		ready(nil)
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	r := newTestRecognizer(b, &output)
+	ctx, cancel := context.WithCancel(context.Background())
+	session, err := r.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	cancel()
+	if err := session.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait error = %v", err)
+	}
+	if _, ok := <-session.Finals(); ok {
+		t.Fatal("finals channel is still open")
+	}
+	if _, ok := <-session.Partials(); ok {
+		t.Fatal("partials channel is still open")
+	}
+	if err := r.Stop(); err != nil {
+		t.Fatalf("Stop after cancellation = %v", err)
+	}
+	second, err := r.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Stop(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("second Stop error = %v", err)
+	}
+}
+
+func TestStartRejectsConcurrentSessionAndWaitsOnStop(t *testing.T) {
+	var output strings.Builder
+	b := &fakeBackend{runFn: func(ctx context.Context, _ Config, _ func(recognitionEvent) error, ready func(error)) error {
+		ready(nil)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	r := newTestRecognizer(b, &output)
+	session, err := r.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Start(context.Background()); !errors.Is(err, ErrSessionActive) {
 		t.Fatalf("second Start error = %v", err)
 	}
-	result := <-session.Results()
-	if result.Phrase != "Open Settings" || result.Timestamp.IsZero() {
-		t.Fatalf("result = %#v", result)
+	if err := r.Stop(); !errors.Is(err, ErrStopped) {
+		t.Fatalf("Stop error = %v", err)
 	}
-	session.Stop()
-	session.Stop()
-	if err := session.Wait(); !errors.Is(err, ErrStopped) {
-		t.Fatalf("Wait error = %v", err)
-	}
-	if _, ok := <-session.Results(); ok {
-		t.Fatal("results channel is still open")
+	select {
+	case <-session.Done():
+	default:
+		t.Fatal("Stop returned before session cleanup")
 	}
 }
 
-func TestRecognizerStopIsIdempotent(t *testing.T) {
-	b := &fakeBackend{
-		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
-		listenFn: func(ctx context.Context, _ []string, _ chan<- Result, ready func(error)) error {
-			ready(nil)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-	r := newTestRecognizer(b)
-	session, err := r.Start(context.Background(), []string{"Stop"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := session.WaitReady(); err != nil {
-		t.Fatalf("WaitReady error = %v", err)
-	}
-	r.Stop()
-	r.Stop()
-	if err := session.Wait(); !errors.Is(err, ErrStopped) {
-		t.Fatalf("Wait error = %v", err)
-	}
-	second, err := r.Start(context.Background(), []string{"Again"})
-	if err != nil {
-		t.Fatalf("Start after stop error = %v", err)
-	}
-	second.Stop()
-	if err := second.Wait(); !errors.Is(err, ErrStopped) {
-		t.Fatalf("second Wait error = %v", err)
-	}
-}
-
-func TestSessionReadinessReportsStartupError(t *testing.T) {
-	expected := errors.New("fake startup failure")
-	b := &fakeBackend{
-		availability: Availability{Supported: true, Language: "en-US", Microphone: true, Recognizer: true},
-		listenFn: func(context.Context, []string, chan<- Result, func(error)) error {
-			return expected
-		},
-	}
-	r := newTestRecognizer(b)
-	session, err := r.Start(context.Background(), []string{"Start"})
+func TestStartupErrorIsAvailableThroughReadinessAndWait(t *testing.T) {
+	var output strings.Builder
+	expected := errors.New("recognizer unavailable")
+	b := &fakeBackend{runFn: func(context.Context, Config, func(recognitionEvent) error, func(error)) error {
+		return expected
+	}}
+	r := newTestRecognizer(b, &output)
+	session, err := r.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,5 +193,18 @@ func TestSessionReadinessReportsStartupError(t *testing.T) {
 	}
 	if err := session.Wait(); !errors.Is(err, expected) {
 		t.Fatalf("Wait error = %v", err)
+	}
+}
+
+func TestNormalizeConfigDefaultsAndMissingModel(t *testing.T) {
+	config, err := normalizeConfig(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.SampleRate != 16000 || config.FeatureDim != 80 || config.Model.Provider != "cpu" || config.Model.ModelType != "zipformer2" {
+		t.Fatalf("defaults = %#v", config)
+	}
+	if _, err := New(Config{}); !errors.Is(err, ErrMissingModel) {
+		t.Fatalf("New empty config error = %v", err)
 	}
 }

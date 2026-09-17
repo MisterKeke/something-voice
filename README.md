@@ -1,112 +1,116 @@
 # something-voice
 
-`something-voice` is a small Go library for recognizing a caller-supplied list of short spoken phrases. It reports phrases to its caller; it does not interpret or execute commands.
+`something-voice` is a standalone Go library for continuous, local speech transcription. It captures microphone audio with [malgo](https://github.com/gen2brain/malgo), recognizes general speech with the streaming [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) Go API, prints each finalized utterance once, and delivers the same finalized utterance to the caller.
 
-## Support and recognition approach
+It does not use Windows Speech Recognition, SAPI grammars, the Web Speech API, a cloud service, or a command-line speech process. It does not execute commands or attach meanings to speech.
 
-The first target is Windows. The Windows implementation uses the locally installed Microsoft Speech API (SAPI) shared recognizer and a dynamically built command-and-control grammar. Microphone audio stays on the machine; this package does not use a network recognition service, save audio, save transcripts, or log recognized speech.
+## Setup
 
-The configured language is `en-US` in the initial integration. A matching local SAPI recognizer must be installed, and Windows must expose an audio-input device. Availability is checked before a session starts. The package never falls back to unrestricted dictation or another engine. Recognition confidence is intentionally not exposed because this API does not need to depend on a fragile confidence interpretation across SAPI engines.
+The module path is `github.com/MisterKeke/something-voice`.
 
-Non-Windows builds compile to a clean unsupported-capability implementation.
-
-## Install
+Pinned dependencies:
 
 ```text
-go get github.com/MisterKeke/something-voice
+github.com/k2-fsa/sherpa-onnx-go v1.13.8
+github.com/gen2brain/malgo v0.11.25
 ```
 
-The Windows implementation depends on the minimal COM interop package `github.com/go-ole/go-ole`.
+The native packages require cgo and a working C toolchain. Supported build targets are Windows, Linux, and macOS on architectures supported by the pinned sherpa-onnx Go packages. Other operating systems, and builds with cgo disabled, return `ErrUnsupported` at startup.
 
-## Import example
+Download a general-purpose streaming model before creating a recognizer. The documented English example is `sherpa-onnx-streaming-zipformer-en-2023-06-26`, available from the [sherpa-onnx ASR model release](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models). Its directory contains four files used by this package:
 
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-
-	voice "github.com/MisterKeke/something-voice"
-)
-
-func check(ctx context.Context) error {
-	recognizer, err := voice.New("en-US")
-	if err != nil {
-		return err
-	}
-	availability, err := recognizer.CheckAvailability(ctx)
-	if err != nil {
-		return fmt.Errorf("voice unavailable: %w", err)
-	}
-	fmt.Printf("language=%s supported=%t microphone=%t recognizer=%t\n",
-		availability.Language, availability.Supported,
-		availability.Microphone, availability.Recognizer)
-	return nil
-}
+```text
+encoder-epoch-99-avg-1-chunk-16-left-128.onnx
+decoder-epoch-99-avg-1-chunk-16-left-128.onnx
+joiner-epoch-99-avg-1-chunk-16-left-128.onnx
+tokens.txt
 ```
 
-## Listening example
+The model documentation lists other online transducer models and languages. Set `ModelConfig.Language` or `Config.Language` as descriptive metadata and provide the corresponding model files. Language selection is determined by the model; the online transducer API does not translate a language tag into a model.
+
+The sherpa-onnx Go API is a cgo wrapper around prebuilt platform native libraries. At runtime, ship the native files for the selected platform and architecture with the application. In particular, the upstream Go documentation says Windows users may need to copy DLLs from the pinned `sherpa-onnx-go-windows` package's `lib/x86_64-pc-windows-gnu` (Win64), `lib/i686-pc-windows-gnu` (Win32), or corresponding arm64 directory beside the executable. See the [upstream Go API installation notes](https://k2-fsa.github.io/sherpa/onnx/go-api/index.html) for platform-specific details. malgo requires cgo; it does not require an extra library on Windows/macOS and links `-ldl` on Linux/BSD systems.
+
+## Library API
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
-recognizer, err := voice.New("en-US")
+recognizer, err := voice.New(voice.Config{
+    Language: "en-US",
+    Model: voice.ModelConfig{
+        Encoder: "/models/encoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+        Decoder: "/models/decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+        Joiner:  "/models/joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
+        Tokens:  "/models/tokens.txt",
+        ModelType: "zipformer2",
+    },
+    OnFinal: func(utterance voice.Utterance) {
+        // Match utterance.Text in the importing application.
+    },
+})
 if err != nil {
-	panic(err)
+    return err
 }
-session, err := recognizer.Start(ctx, []string{"open settings", "close settings"})
-if err != nil {
-	panic(err)
-}
-defer session.Stop()
 
+session, err := recognizer.Start(ctx)
+if err != nil {
+    return err
+}
 if err := session.WaitReady(); err != nil {
-	panic(err)
+    return err
 }
 
-fmt.Println("Listening.")
-
-for {
-	select {
-	case result, ok := <-session.Results():
-		if !ok {
-			return
-		}
-		// The caller decides what result.Phrase means.
-		fmt.Println(result.Phrase, result.Timestamp)
-	case err, ok := <-session.Errors():
-		if ok {
-			fmt.Println("listening ended:", err)
-		}
-		return
-	}
+for utterance := range session.Finals() {
+    _ = utterance // The library has already printed this line to Output.
 }
+return session.Wait()
 ```
 
-`Session.WaitReady` (or the close notification from `Session.Ready`) lets a UI wait until SAPI setup has succeeded before showing a listening state. `Session.Stop`, `Recognizer.Stop`, and context cancellation are idempotent ways to stop capture. Results use a bounded channel; a slow consumer applies backpressure, and cancellation still releases the SAPI objects and worker thread.
+`Config.Output` defaults to `os.Stdout`; inject a `bytes.Buffer` or another in-memory `io.Writer` in tests. The library never opens a transcript file. `OnFinal` and `Session.Finals()` are alternative ways to receive actionable finalized text; do not print it again in the caller if you want one console line per utterance. `Session.Partials()` and `OnPartial` are informational and are never printed or delivered as final events.
 
-## Limitations
+Call `session.Stop()` or `recognizer.Stop()` to cancel capture and wait until the microphone, sherpa stream/recognizer, malgo device/context, and worker have been released. Context cancellation has the same cleanup guarantee. Start and Stop are serialized so a session cannot be replaced while its resources are still being released.
 
-- Windows SAPI and an installed matching local speech recognizer are required for recognition.
-- The installed recognizer determines pronunciation and language quality; the library does not download or install engines.
-- Only one session may be active per `Recognizer`.
-- The grammar is limited to at most 64 phrases, each at most 128 Unicode code points.
-- The package reports canonical forms from the supplied phrase list and never executes an action.
+## Runtime behavior and privacy
+
+The malgo callback only copies one bounded PCM chunk into an in-memory queue. Recognition runs on the session worker, away from the callback. If the queue fills, the newest chunk is dropped, the session is canceled, and `ErrAudioOverload` is reported; the queue never grows without bound. A malgo stop notification ends the session with `ErrMicrophoneDisconnected`.
+
+The library retains microphone samples and event text in memory only. It never writes audio, transcripts, temporary recordings, or transcript logs to a file or database, and it never sends audio or transcripts over the network. Model and native runtime files are read locally. Microphone permission is controlled by the operating system and must be granted by the host application/user.
+
+Final text is emitted only when sherpa-onnx reports an endpoint. A partial may change several times while the user is speaking and is not a command. Only speech recognized by the selected model can be printed; this library does not claim word-perfect transcription.
+
+Errors include `ErrMissingModel`, `ErrNoMicrophone`, `ErrDeviceUnavailable`, `ErrMicrophonePermission`, `ErrMicrophoneDisconnected`, `ErrRecognizerInit`, `ErrRecognition`, `ErrAudioOverload`, `ErrUnsupported`, and `ErrOutput`. Use `errors.Is` when handling them.
+
+## Demo
+
+`cmd/voice-demo` is a small terminal listener. It uses the library's own stdout printing and waits for Ctrl+C:
+
+```text
+go run ./cmd/voice-demo -encoder /models/encoder.onnx -decoder /models/decoder.onnx -joiner /models/joiner.onnx -tokens /models/tokens.txt
+```
+
+Use `-microphone` with a malgo device ID or name; leave it empty for the OS default. The demo does not match phrases or perform actions.
+
+## Licensing and attribution
+
+The library source in this repository is MIT licensed; see [LICENSE](LICENSE).
+
+This project includes or links to these external components:
+
+* [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), including its Go bindings and native runtime, is Apache-2.0 licensed. Preserve upstream notices when redistributing native files.
+* [malgo](https://github.com/gen2brain/malgo) is released into the public domain under its included Unlicense/public-domain dedication.
+* The suggested `sherpa-onnx-streaming-zipformer-en-2023-06-26` model is a separate model artifact. Review the license and attribution included with the exact model archive before redistribution or commercial deployment; this repository does not redistribute model weights and does not assume that the sherpa-onnx source license covers them.
 
 ## Manual verification
 
-Tests and builds were intentionally not run while preparing this repository. On a supported Windows machine, run these commands yourself:
+Per the project request, tests, builds, the demo, and other development commands were not run. Run these manually from the repository root after installing native prerequisites:
 
 ```text
+go mod tidy
 go test ./...
 go vet ./...
 go build ./...
+go run ./cmd/voice-demo -encoder <encoder.onnx> -decoder <decoder.onnx> -joiner <joiner.onnx> -tokens <tokens.txt>
 ```
 
-Then integrate the listening example in a small host program, confirm `CheckAvailability` reports `en-US`, speak only supplied phrases, cancel the context, and verify that the result channel closes. Also verify Windows microphone privacy permissions and the installed Speech Recognition language in Settings.
-
-## License
-
-No license file was added because no license choice was supplied. Choose and add a license before treating the public repository as generally redistributable.
+For Something-v2, tag this breaking rewrite as `v0.2.0` and import `github.com/MisterKeke/something-voice@v0.2.0`.

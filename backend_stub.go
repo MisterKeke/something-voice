@@ -1,22 +1,18 @@
-//go:build !windows
+//go:build !cgo || (!windows && !linux && !darwin)
 
 package voice
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
-type unsupportedBackend struct{ language string }
+type unsupportedBackend struct{}
 
-func newBackend(language string) (backend, error) {
-	return unsupportedBackend{language: language}, nil
+func newBackend() (backend, error) {
+	return unsupportedBackend{}, nil
 }
 
-func (b unsupportedBackend) checkAvailability(context.Context) (Availability, error) {
-	return Availability{
-		Language: b.language,
-		Reason:   "Windows SAPI is required",
-	}, ErrUnsupported
-}
-
-func (b unsupportedBackend) listen(context.Context, []string, chan<- Result, func(error)) error {
-	return ErrUnsupported
+func (unsupportedBackend) run(context.Context, Config, func(recognitionEvent) error, func(error)) error {
+	return fmt.Errorf("%w: cgo with Windows, Linux, or macOS is required", ErrUnsupported)
 }
